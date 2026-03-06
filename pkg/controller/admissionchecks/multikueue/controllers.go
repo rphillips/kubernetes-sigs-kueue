@@ -37,14 +37,15 @@ const (
 )
 
 type SetupOptions struct {
-	gcInterval           time.Duration
-	origin               string
-	workerLostTimeout    time.Duration
-	eventsBatchPeriod    time.Duration
-	adapters             map[string]jobframework.MultiKueueAdapter
-	dispatcherName       string
-	clusterProfileConfig *configapi.ClusterProfile
-	roleTracker          *roletracker.RoleTracker
+	gcInterval            time.Duration
+	origin                string
+	workerLostTimeout     time.Duration
+	eventsBatchPeriod     time.Duration
+	adapters              map[string]jobframework.MultiKueueAdapter
+	dispatcherName        string
+	clusterProfileConfig  *configapi.ClusterProfile
+	clusterProfileEnabled bool
+	roleTracker           *roletracker.RoleTracker
 }
 
 type SetupOption func(o *SetupOptions)
@@ -101,6 +102,12 @@ func WithClusterProfiles(clusterProfiles *configapi.ClusterProfile) SetupOption 
 	}
 }
 
+func WithClusterProfileEnabled(enabled bool) SetupOption {
+	return func(o *SetupOptions) {
+		o.clusterProfileEnabled = enabled
+	}
+}
+
 // WithRoleTracker sets the role tracker for HA logging.
 func WithRoleTracker(tracker *roletracker.RoleTracker) SetupOption {
 	return func(o *SetupOptions) {
@@ -110,12 +117,13 @@ func WithRoleTracker(tracker *roletracker.RoleTracker) SetupOption {
 
 func SetupControllers(mgr ctrl.Manager, namespace string, opts ...SetupOption) error {
 	options := &SetupOptions{
-		gcInterval:        defaultGCInterval,
-		origin:            defaultOrigin,
-		workerLostTimeout: defaultWorkerLostTimeout,
-		eventsBatchPeriod: constants.UpdatesBatchPeriod,
-		adapters:          make(map[string]jobframework.MultiKueueAdapter),
-		dispatcherName:    configapi.MultiKueueDispatcherModeAllAtOnce,
+		gcInterval:            defaultGCInterval,
+		origin:                defaultOrigin,
+		workerLostTimeout:     defaultWorkerLostTimeout,
+		eventsBatchPeriod:     constants.UpdatesBatchPeriod,
+		adapters:              make(map[string]jobframework.MultiKueueAdapter),
+		dispatcherName:        configapi.MultiKueueDispatcherModeAllAtOnce,
+		clusterProfileEnabled: true,
 	}
 
 	for _, o := range opts {
@@ -134,7 +142,7 @@ func SetupControllers(mgr ctrl.Manager, namespace string, opts ...SetupOption) e
 	}
 
 	var cpCreds clusterProfileCreds
-	if features.Enabled(features.MultiKueueClusterProfile) && options.clusterProfileConfig != nil {
+	if features.Enabled(features.MultiKueueClusterProfile) && options.clusterProfileEnabled && options.clusterProfileConfig != nil {
 		p := make([]credentials.Provider, 0, len(options.clusterProfileConfig.CredentialsProviders))
 		for _, provider := range options.clusterProfileConfig.CredentialsProviders {
 			p = append(p, credentials.Provider{
@@ -148,7 +156,7 @@ func SetupControllers(mgr ctrl.Manager, namespace string, opts ...SetupOption) e
 		cpCreds = &NoOpClusterProfileCreds{}
 	}
 
-	cRec := newClustersReconciler(mgr.GetClient(), namespace, options.gcInterval, options.origin, fsWatcher, options.adapters, cpCreds, options.roleTracker)
+	cRec := newClustersReconciler(mgr.GetClient(), namespace, options.gcInterval, options.origin, fsWatcher, options.adapters, cpCreds, options.clusterProfileEnabled, options.roleTracker)
 	err = cRec.setupWithManager(mgr)
 	if err != nil {
 		return err

@@ -19,10 +19,8 @@ package jobframework
 import (
 	"context"
 	"net/http"
-	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/google/go-cmp/cmp"
 	"github.com/google/go-cmp/cmp/cmpopts"
@@ -31,15 +29,20 @@ import (
 	rayv1 "github.com/ray-project/kuberay/ray-operator/apis/ray/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	dynamicfake "k8s.io/client-go/dynamic/fake"
 	"k8s.io/client-go/rest"
+	kubetesting "k8s.io/client-go/testing"
 	"k8s.io/klog/v2"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlmgr "sigs.k8s.io/controller-runtime/pkg/manager"
 	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
 
 	kueue "sigs.k8s.io/kueue/apis/kueue/v1beta2"
+	"sigs.k8s.io/kueue/pkg/servicediscovery"
 	"sigs.k8s.io/kueue/pkg/util/slices"
 	utiltesting "sigs.k8s.io/kueue/pkg/util/testing"
 	utiltestingapi "sigs.k8s.io/kueue/pkg/util/testing/v1beta2"
@@ -59,6 +62,7 @@ func TestSetupControllers(t *testing.T) {
 			NewReconciler:         testNewReconciler,
 			SetupWebhook:          testSetupWebhook,
 			JobType:               &kfmpi.MPIJob{},
+			GVK:                   kfmpi.SchemeGroupVersionKind,
 			SetupIndexes:          testSetupIndexes,
 			AddToScheme:           testAddToScheme,
 			CanSupportIntegration: testCanSupportIntegration,
@@ -75,6 +79,7 @@ func TestSetupControllers(t *testing.T) {
 			NewReconciler:         testNewReconciler,
 			SetupWebhook:          testSetupWebhook,
 			JobType:               &rayv1.RayCluster{},
+			GVK:                   rayv1.GroupVersion.WithKind("RayCluster"),
 			SetupIndexes:          testSetupIndexes,
 			AddToScheme:           testAddToScheme,
 			CanSupportIntegration: testCanSupportIntegration,
@@ -84,7 +89,7 @@ func TestSetupControllers(t *testing.T) {
 	cases := map[string]struct {
 		opts                    []Option
 		mapperGVKs              []schema.GroupVersionKind
-		delayedGVKs             []*schema.GroupVersionKind
+		installedControllers    []servicediscovery.Controller
 		wantError               error
 		wantEnabledIntegrations []string
 	}{
@@ -100,6 +105,9 @@ func TestSetupControllers(t *testing.T) {
 				batchv1.SchemeGroupVersion.WithKind("Job"),
 				kfmpi.SchemeGroupVersionKind,
 			},
+			installedControllers: []servicediscovery.Controller{
+				servicediscovery.MPIJob,
+			},
 			wantEnabledIntegrations: []string{"batch/job", "kubeflow.org/mpijob"},
 		},
 		"mapper doesn't have kubeflow.org/mpijob, but no error occur": {
@@ -111,19 +119,18 @@ func TestSetupControllers(t *testing.T) {
 			},
 			wantEnabledIntegrations: []string{"batch/job"},
 		},
-		"mapper doesn't have ray.io/raycluster when Controllers have been setup, but eventually does": {
+		"ray.io/raycluster CRD missing at startup is skipped permanently": {
 			opts: []Option{
 				WithEnabledFrameworks([]string{"batch/job", "kubeflow.org/mpijob", "ray.io/raycluster"}),
 			},
 			mapperGVKs: []schema.GroupVersionKind{
 				batchv1.SchemeGroupVersion.WithKind("Job"),
 				kfmpi.SchemeGroupVersionKind,
-				// Not including RayCluster
 			},
-			delayedGVKs: []*schema.GroupVersionKind{
-				{Group: "ray.io", Version: "v1", Kind: "RayCluster"},
+			installedControllers: []servicediscovery.Controller{
+				servicediscovery.MPIJob,
 			},
-			wantEnabledIntegrations: []string{"batch/job", "kubeflow.org/mpijob", "ray.io/raycluster"},
+			wantEnabledIntegrations: []string{"batch/job", "kubeflow.org/mpijob"},
 		},
 	}
 	for name, tc := range cases {
@@ -137,6 +144,7 @@ func TestSetupControllers(t *testing.T) {
 			}
 
 			ctx, logger := utiltesting.ContextWithLog(t)
+			populateDiscoveredCRDs(t, tc.installedControllers)
 			k8sClient := utiltesting.NewClientBuilder(jobset.AddToScheme, kfmpi.AddToScheme, kftraining.AddToScheme, rayv1.AddToScheme).Build()
 
 			mgrOpts := ctrlmgr.Options{
@@ -169,13 +177,6 @@ func TestSetupControllers(t *testing.T) {
 				t.Errorf("Unexpected error from SetupControllers (-want,+got):\n%s", diff)
 			}
 
-			if len(tc.delayedGVKs) > 0 {
-				simulateDelayedIntegration(mgr, tc.delayedGVKs)
-				for _, gvk := range tc.delayedGVKs {
-					testDelayedIntegration(&manager, gvk.Group+"/"+strings.ToLower(gvk.Kind))
-				}
-			}
-
 			diff := cmp.Diff(tc.wantEnabledIntegrations, manager.getEnabledIntegrations().SortedList())
 			if len(diff) != 0 {
 				t.Errorf("Unexpected enabled integrations (-want,+got):\n%s", diff)
@@ -195,24 +196,29 @@ func (m *TestRESTMapper) RESTMapping(gk schema.GroupKind, versions ...string) (*
 	return m.DefaultRESTMapper.RESTMapping(gk, versions...)
 }
 
-// Simulates the delayed availability of GVKs
-func simulateDelayedIntegration(mgr ctrlmgr.Manager, delayedGVKs []*schema.GroupVersionKind) {
-	mapper := mgr.GetRESTMapper().(*TestRESTMapper)
-	mapper.lock.Lock()
-	defer mapper.lock.Unlock()
+func populateDiscoveredCRDs(t *testing.T, installedControllers []servicediscovery.Controller) {
+	t.Helper()
 
-	for _, gvk := range delayedGVKs {
-		mapper.Add(*gvk, apimeta.RESTScopeNamespace)
+	installed := make(map[servicediscovery.Controller]struct{}, len(installedControllers))
+	for _, controller := range installedControllers {
+		installed[controller] = struct{}{}
 	}
-}
 
-func testDelayedIntegration(manager *integrationManager, crdName string) {
-	for {
-		_, ok := manager.getEnabledIntegrations()[crdName]
-		if ok {
-			break
+	dynamicClient := dynamicfake.NewSimpleDynamicClient(runtime.NewScheme())
+	dynamicClient.PrependReactor("get", "*", func(action kubetesting.Action) (bool, runtime.Object, error) {
+		getAction := action.(kubetesting.GetAction)
+		gvr := getAction.GetResource()
+		for controller := range installed {
+			controllerGVR, _ := servicediscovery.GVRForController(controller)
+			if controllerGVR == gvr {
+				return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: gvr.Group, Resource: gvr.Resource}, "__kueue_crd_probe__")
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		return true, nil, apierrors.NewNotFound(schema.GroupResource{Group: gvr.Group, Resource: gvr.Resource}, "")
+	})
+
+	if _, err := servicediscovery.EnumerateCRDs(dynamicClient, "kueue-system"); err != nil {
+		t.Fatalf("EnumerateCRDs() error: %v", err)
 	}
 }
 

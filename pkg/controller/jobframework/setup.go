@@ -29,6 +29,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+
+	"sigs.k8s.io/kueue/pkg/servicediscovery"
 )
 
 const (
@@ -82,6 +84,12 @@ func (m *integrationManager) setupControllers(ctx context.Context, mgr ctrl.Mana
 			gvk, err := apiutil.GVKForObject(cb.JobType, mgr.GetScheme())
 			if err != nil {
 				return fmt.Errorf("%s: %w: %w", fwkNamePrefix, errFailedMappingResource, err)
+			}
+			if controller, found := servicediscovery.ControllerForFramework(name); found {
+				if status, ok := servicediscovery.GetCRDStatus(controller); ok && !status.Enabled {
+					logger.Info("Skipping controller startup because CRD is not installed", "controller", controller, "framework", name)
+					return nil
+				}
 			}
 			if err := restMappingExists(mgr, gvk); err != nil {
 				if !meta.IsNoMatchError(err) {
@@ -187,6 +195,11 @@ func SetupIndexes(ctx context.Context, indexer client.FieldIndexer, opts ...Opti
 	allEnabledIntegrations := options.EnabledFrameworks.Union(manager.collectImplicitlyEnabledIntegrations(options.EnabledFrameworks))
 	return ForEachIntegration(func(name string, cb IntegrationCallbacks) error {
 		if allEnabledIntegrations.Has(name) {
+			if controller, found := servicediscovery.ControllerForFramework(name); found {
+				if status, ok := servicediscovery.GetCRDStatus(controller); ok && !status.Enabled {
+					return nil
+				}
+			}
 			if err := cb.SetupIndexes(ctx, indexer); err != nil {
 				return fmt.Errorf("jobFrameworkName %q: %w", name, err)
 			}

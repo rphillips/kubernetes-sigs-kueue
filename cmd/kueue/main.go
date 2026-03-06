@@ -36,6 +36,7 @@ import (
 	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	autoscaling "k8s.io/autoscaler/cluster-autoscaler/apis/provisioningrequest/autoscaling.x-k8s.io/v1"
 	"k8s.io/client-go/discovery"
+	"k8s.io/client-go/dynamic"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/flowcontrol"
@@ -73,6 +74,7 @@ import (
 	"sigs.k8s.io/kueue/pkg/metrics"
 	"sigs.k8s.io/kueue/pkg/scheduler"
 	"sigs.k8s.io/kueue/pkg/scheduler/preemption/fairsharing"
+	"sigs.k8s.io/kueue/pkg/servicediscovery"
 	"sigs.k8s.io/kueue/pkg/util/cert"
 	"sigs.k8s.io/kueue/pkg/util/kubeversion"
 	utillogging "sigs.k8s.io/kueue/pkg/util/logging"
@@ -232,6 +234,29 @@ func main() {
 	}
 	setupLog.V(2).Info("K8S Client", "qps", *cfg.ClientConnection.QPS, "burst", *cfg.ClientConnection.Burst)
 
+	dynamicClient, err := dynamic.NewForConfig(kubeConfig)
+	if err != nil {
+		setupLog.Error(err, "Unable to create dynamic client")
+		os.Exit(1)
+	}
+	discoveredControllers := servicediscovery.ControllersForFrameworks(cfg.Integrations.Frameworks)
+	discoveredControllers = append(discoveredControllers, servicediscovery.ProvisioningRequest)
+	if features.Enabled(features.MultiKueue) && features.Enabled(features.MultiKueueClusterProfile) {
+		discoveredControllers = append(discoveredControllers, servicediscovery.ClusterProfile)
+	}
+	crdResults, err := servicediscovery.EnumerateCRDsForControllers(dynamicClient, *cfg.Namespace, discoveredControllers)
+	if err != nil {
+		setupLog.Error(err, "Unable to enumerate external controller CRDs")
+		os.Exit(1)
+	}
+	for controller, status := range crdResults {
+		if status.Enabled {
+			setupLog.Info("CRD discovered, controller will be started", "controller", controller, "gvr", status.GVR)
+		} else {
+			setupLog.Info("CRD not found, controller will be skipped", "controller", controller, "gvr", status.GVR)
+		}
+	}
+
 	ctx := ctrl.SetupSignalHandler()
 	// Bootstrap certificates before creating the main manager
 	// This ensures certs are ready and CA bundles are injected into conversion CRDs
@@ -243,9 +268,13 @@ func main() {
 	}
 
 	if features.Enabled(features.MultiKueueClusterProfile) {
-		if err := config.ConfigureClusterProfileCache(ctx, setupLog, &options, kubeConfig, cfg); err != nil {
-			setupLog.Error(err, "Unable to configure cluster profile")
-			os.Exit(1)
+		if servicediscovery.IsCRDEnabled(servicediscovery.ClusterProfile) {
+			if err := config.ConfigureClusterProfileCache(ctx, setupLog, &options, kubeConfig, cfg); err != nil {
+				setupLog.Error(err, "Unable to configure cluster profile")
+				os.Exit(1)
+			}
+		} else {
+			setupLog.Info("Skipping MultiKueue ClusterProfile cache setup: ClusterProfile CRD is not installed")
 		}
 	}
 
@@ -365,8 +394,8 @@ func setupIndexes(ctx context.Context, mgr ctrl.Manager, cfg *configapi.Configur
 	}
 
 	// setup provision admission check controller indexes
-	if err := provisioning.ServerSupportsProvisioningRequest(mgr); err != nil {
-		setupLog.Error(err, "Skipping admission check controller setup: Provisioning Requests not supported (Possible cause: missing or unsupported cluster-autoscaler)")
+	if !servicediscovery.IsCRDEnabled(servicediscovery.ProvisioningRequest) {
+		setupLog.Info("Skipping admission check controller index setup: ProvisioningRequest CRD is not installed")
 	} else if err := provisioning.SetupIndexer(ctx, mgr.GetFieldIndexer()); err != nil {
 		return fmt.Errorf("could not setup provisioning indexer: %w", err)
 	}
@@ -400,8 +429,8 @@ func setupControllers(ctx context.Context, mgr ctrl.Manager, cCache *schdcache.C
 	}
 
 	// setup provision admission check controller
-	if err := provisioning.ServerSupportsProvisioningRequest(mgr); err != nil {
-		setupLog.Info("Skipping provisioning controller setup: Provisioning Requests not supported (Possible cause: missing or unsupported cluster-autoscaler)")
+	if !servicediscovery.IsCRDEnabled(servicediscovery.ProvisioningRequest) {
+		setupLog.Info("Skipping provisioning controller setup: ProvisioningRequest CRD is not installed")
 	} else {
 		ctrl, err := provisioning.NewController(mgr.GetClient(), mgr.GetEventRecorderFor("kueue-provisioning-request-controller"), roleTracker)
 		if err != nil {
@@ -440,6 +469,7 @@ func setupControllers(ctx context.Context, mgr ctrl.Manager, cCache *schdcache.C
 			multikueue.WithAdapters(adapters),
 			multikueue.WithDispatcherName(ptr.Deref(cfg.MultiKueue.DispatcherName, configapi.MultiKueueDispatcherModeAllAtOnce)),
 			multikueue.WithClusterProfiles(cfg.MultiKueue.ClusterProfile),
+			multikueue.WithClusterProfileEnabled(servicediscovery.IsCRDEnabled(servicediscovery.ClusterProfile)),
 			multikueue.WithRoleTracker(roleTracker),
 		); err != nil {
 			return fmt.Errorf("could not setup MultiKueue controller: %w", err)

@@ -663,7 +663,7 @@ func TestUpdateConfig(t *testing.T) {
 			c := builder.Build()
 
 			adapters, _ := jobframework.GetMultiKueueAdapters(sets.New("batch/job"))
-			reconciler := newClustersReconciler(c, TestNamespace, 0, defaultOrigin, nil, adapters, tc.cpCreds, nil)
+			reconciler := newClustersReconciler(c, TestNamespace, 0, defaultOrigin, nil, adapters, tc.cpCreds, true, nil)
 
 			reconciler.rootContext = ctx
 

@@ -1552,7 +1552,7 @@ func TestWlReconcile(t *testing.T) {
 
 				managerClient := managerBuilder.Build()
 				adapters, _ := jobframework.GetMultiKueueAdapters(sets.New("batch/job"))
-				cRec := newClustersReconciler(managerClient, TestNamespace, 0, defaultOrigin, nil, adapters, nil, nil)
+				cRec := newClustersReconciler(managerClient, TestNamespace, 0, defaultOrigin, nil, adapters, nil, true, nil)
 
 				worker1Client := getClientBuilder(ctx).
 					WithLists(&kueue.WorkloadList{Items: tc.worker1Workloads}, &batchv1.JobList{Items: tc.worker1Jobs}).

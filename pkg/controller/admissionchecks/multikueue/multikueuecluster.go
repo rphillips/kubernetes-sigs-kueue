@@ -357,7 +357,8 @@ type clustersReconciler struct {
 
 	adapters map[string]jobframework.MultiKueueAdapter
 
-	clusterProfileCreds clusterProfileCreds
+	clusterProfileCreds   clusterProfileCreds
+	clusterProfileEnabled bool
 
 	roleTracker *roletracker.RoleTracker
 }
@@ -472,6 +473,9 @@ func (c *clustersReconciler) loadClientConfig(ctx context.Context, cluster *kueu
 	if cluster.Spec.ClusterSource.ClusterProfileRef != nil {
 		if !features.Enabled(features.MultiKueueClusterProfile) {
 			return nil, "MultiKueueClusterProfileFeatureDisabled", errors.New("MultiKueueClusterProfile feature gate is disabled")
+		}
+		if !c.clusterProfileEnabled {
+			return nil, "ClusterProfileCRDNotInstalled", errors.New("ClusterProfile CRD is not installed")
 		}
 		restConfig, err := c.getRestConfigFromClusterProfile(ctx, cluster.Spec.ClusterSource.ClusterProfileRef)
 		if err != nil {
@@ -685,19 +689,20 @@ func (c *clustersReconciler) getRemoteClients() []*remoteClient {
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=multikueueclusters,verbs=get;list;watch
 // +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=multikueueclusters/status,verbs=get;update;patch
 
-func newClustersReconciler(c client.Client, namespace string, gcInterval time.Duration, origin string, fsWatcher *KubeConfigFSWatcher, adapters map[string]jobframework.MultiKueueAdapter, cpCreds clusterProfileCreds, roleTracker *roletracker.RoleTracker) *clustersReconciler {
+func newClustersReconciler(c client.Client, namespace string, gcInterval time.Duration, origin string, fsWatcher *KubeConfigFSWatcher, adapters map[string]jobframework.MultiKueueAdapter, cpCreds clusterProfileCreds, clusterProfileEnabled bool, roleTracker *roletracker.RoleTracker) *clustersReconciler {
 	return &clustersReconciler{
-		localClient:         c,
-		configNamespace:     namespace,
-		remoteClients:       make(map[string]*remoteClient),
-		wlUpdateCh:          make(chan event.GenericEvent, eventChBufferSize),
-		gcInterval:          gcInterval,
-		origin:              origin,
-		watchEndedCh:        make(chan event.GenericEvent, eventChBufferSize),
-		fsWatcher:           fsWatcher,
-		adapters:            adapters,
-		clusterProfileCreds: cpCreds,
-		roleTracker:         roleTracker,
+		localClient:           c,
+		configNamespace:       namespace,
+		remoteClients:         make(map[string]*remoteClient),
+		wlUpdateCh:            make(chan event.GenericEvent, eventChBufferSize),
+		gcInterval:            gcInterval,
+		origin:                origin,
+		watchEndedCh:          make(chan event.GenericEvent, eventChBufferSize),
+		fsWatcher:             fsWatcher,
+		adapters:              adapters,
+		clusterProfileCreds:   cpCreds,
+		clusterProfileEnabled: clusterProfileEnabled,
+		roleTracker:           roleTracker,
 	}
 }
 
@@ -784,7 +789,7 @@ func (c *clustersReconciler) setupWithManager(mgr ctrl.Manager) error {
 		WithOptions(controller.Options{
 			LogConstructor: roletracker.NewLogConstructor(c.roleTracker, "multikueue-cluster"),
 		})
-	if features.Enabled(features.MultiKueueClusterProfile) {
+	if features.Enabled(features.MultiKueueClusterProfile) && c.clusterProfileEnabled {
 		systemNamespacePredicate := predicate.NewPredicateFuncs(func(obj client.Object) bool {
 			return obj.GetNamespace() == c.configNamespace
 		})
